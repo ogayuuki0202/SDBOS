@@ -10,13 +10,6 @@ This repository provides source code and examples for applying SD-BOS in experim
   Real-time processing with **PyTorch** (CPU/GPU support).  
   - ~18 FPS for 512×512 images on CPU  
   - ~85 FPS on GPU (NVIDIA RTX series)  
-  
-
-- **Robust to Noise and Occlusions**  
-  Mitigates phase inversion artifacts by adjusting stripe width.
-
-- **Real-Time Visualization**  
-  Includes demo code for live experiments with webcams and high-speed cameras.
 
 ---
 

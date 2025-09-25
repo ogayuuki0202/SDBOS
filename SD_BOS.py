@@ -292,10 +292,11 @@ if __name__ == "__main__":
     from mpl_toolkits.axes_grid1 import make_axes_locatable
 
     # 画像の読み込み
-    ref_image = cv2.imread("In_Image/DSC_8321.JPG", cv2.IMREAD_GRAYSCALE)
-    exp_image = cv2.imread("In_Image/DSC_8323.JPG", cv2.IMREAD_GRAYSCALE)
-
-    sdbos = SD_BOS( device='cuda')
+    ref_image = cv2.imread("your/image", cv2.IMREAD_GRAYSCALE)
+    exp_image = cv2.imread("your/image", cv2.IMREAD_GRAYSCALE)
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(device)
+    sdbos = SD_BOS( device=device)
 
     # 位相シフトの計算
     shift_x,shift_y = sdbos(ref_image, exp_image)
