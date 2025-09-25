@@ -42,38 +42,58 @@ class DepthwiseSobel(nn.Module):
         gy = F.conv2d(img_pad, self.ky, groups=img.shape[1])
         return gx, gy
 
-
-@lru_cache(maxsize=32)
-def _gaussian_kernel1d_cached(sigma: float, truncate: float, device_str: str, dtype_str: str):
-    # LRU cache by value; device/dtype via string keys to keep the cache simple
-    device = torch.device(device_str)
-    dtype = getattr(torch, dtype_str)
-    radius = int(math.ceil(truncate * sigma))
-    x = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
-    k = torch.exp(-0.5 * (x / sigma) ** 2)
-    k = k / k.sum()
-    return k
-
-
-def gaussian_blur_1d(img: torch.Tensor, sigma: float, truncate: float = 3.0, direction: str = 'horizontal'):
+def box_kernel1d(kernel_size: int, device=None, dtype=None):
     """
-    Separable 1-D Gaussian using conv2d depthwise. Expects [B,C,H,W].
+    1D 矩形(ボックス)カーネル（L1正規化）を返す（shape: [K]）。
+    kernel_size = K >= 1（奇数・偶数どちらも可）。
     """
-    assert img.ndim == 4
-    k1d = _gaussian_kernel1d_cached(sigma, truncate, str(img.device), str(img.dtype).split('.')[-1])
-    K = k1d.numel()
-    r = (K - 1) // 2
-    if direction == 'horizontal':
-        pad = (r, r, 0, 0)
-        kernel = k1d.view(1, 1, 1, K)
-    elif direction == 'vertical':
-        pad = (0, 0, r, r)
-        kernel = k1d.view(1, 1, K, 1)
+    if kernel_size < 1:
+        raise ValueError("kernel_size must be >= 1")
+    k = torch.ones(kernel_size, device=device, dtype=dtype)
+    k = k / k.numel()
+    return k  # [K]
+
+
+def box_blur_1d(img: torch.Tensor, kernel_size: int,
+                padding: str = "reflect", direction: str = "horizontal"):
+    """
+    AvgPool2d を用いた高速 1D ボックス平滑化。
+    """
+    if kernel_size < 1:
+        raise ValueError("kernel_size must be >= 1")
+
+    squeeze_c = False
+    squeeze_n = False
+    if img.ndim == 2:
+        img = img.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+        squeeze_c = True; squeeze_n = True
+    elif img.ndim == 3:
+        img = img.unsqueeze(0)               # [1,C,H,W]
+        squeeze_n = True
+    elif img.ndim != 4:
+        raise ValueError("img must be 2D, 3D, or 4D tensor")
+
+    img = img.to(dtype=torch.float32)
+
+    K = int(kernel_size)
+    pad_left  = (K - 1) // 2
+    pad_right = (K - 1) - pad_left
+
+    if direction == "horizontal":
+        # (left, right, top, bottom)
+        img_padded = F.pad(img, (pad_left, pad_right, 0, 0), mode=padding)
+        out = F.avg_pool2d(img_padded, kernel_size=(1, K), stride=1, padding=0)
+    elif direction == "vertical":
+        img_padded = F.pad(img, (0, 0, pad_left, pad_right), mode=padding)
+        out = F.avg_pool2d(img_padded, kernel_size=(K, 1), stride=1, padding=0)
     else:
         raise ValueError("direction must be 'horizontal' or 'vertical'")
-    img_pad = F.pad(img, pad, mode='reflect')
-    weight = kernel.expand(img.shape[1], 1, *kernel.shape[2:]).contiguous()
-    return F.conv2d(img_pad, weight=weight, groups=img.shape[1])
+
+    if squeeze_n and squeeze_c:
+        out = out[0, 0]
+    elif squeeze_n:
+        out = out[0]
+    return out
 
 
 def otsu_binarize_batch(img: torch.Tensor):
@@ -242,30 +262,23 @@ class SD_BOS(nn.Module):
         ref_y_bin = ref_y_bin.float()
         exp_y_bin = exp_y_bin.float()
 
-        # --- 3) Separable 1D Gaussian (cached kernels) ---
-        s = 100.0
-        trunc = 2.0
+        # --- 3) Separable 1D BOX filter 
+        k1d=30
         # vertical blur for x stripes; horizontal for y stripes
-        ref_x_blur = gaussian_blur_1d(ref_x_bin, sigma=s, truncate=trunc, direction='vertical')
-        exp_x_blur = gaussian_blur_1d(exp_x_bin, sigma=s, truncate=trunc, direction='vertical')
-        ref_y_blur = gaussian_blur_1d(ref_y_bin, sigma=s, truncate=trunc, direction='horizontal')
-        exp_y_blur = gaussian_blur_1d(exp_y_bin, sigma=s, truncate=trunc, direction='horizontal')
+        ref_x_bin_blur = box_blur_1d(ref_x_bin.to(dtype=torch.float32), kernel_size=k1d,direction='vertical')
+        exp_x_bin_blur = box_blur_1d(exp_x_bin.to(dtype=torch.float32), kernel_size=k1d,direction='vertical')
+        ref_y_bin_blur = box_blur_1d(ref_y_bin.to(dtype=torch.float32), kernel_size=k1d,direction='horizontal')
+        exp_y_bin_blur = box_blur_1d(exp_y_bin.to(dtype=torch.float32), kernel_size=k1d,direction='horizontal')
 
-        # optional: binarize again on-device
-        ref_x_blur_bin, _ = otsu_binarize_batch(ref_x_blur)
-        exp_x_blur_bin, _ = otsu_binarize_batch(exp_x_blur)
-        ref_y_blur_bin, _ = otsu_binarize_batch(ref_y_blur)
-        exp_y_blur_bin, _ = otsu_binarize_batch(exp_y_blur)
 
         # --- 4) Phase shift (fully vectorized; avoid CPU/NumPy hops) ---
         # rotate x case by 90 deg using torch.rot90 (on GPU)
-        ref_x_rot = torch.rot90(ref_x_blur_bin[0,0], 1, dims=(0,1)).float()
-        exp_x_rot = torch.rot90(exp_x_blur_bin[0,0], 1, dims=(0,1)).float()
+        ref_x_rot = torch.rot90(ref_x_bin_blur[0,0], 1, dims=(0,1)).float()
+        exp_x_rot = torch.rot90(exp_x_bin_blur[0,0], 1, dims=(0,1)).float()
         shift_x = torch.rot90(self.phase(ref_x_rot, exp_x_rot), -1, dims=(0,1))
-        shift_y = self.phase(ref_y_blur_bin[0,0].float(), exp_y_blur_bin[0,0].float())
+        shift_y = self.phase(ref_y_bin_blur[0,0].float(), exp_y_bin_blur[0,0].float())
 
         return shift_x, shift_y
-
 
 # Optionally compile the whole model for extra speed (PyTorch 2.x)
 if USE_TORCH_COMPILE:
@@ -287,7 +300,7 @@ if __name__ == "__main__":
     # 位相シフトの計算
     shift_x,shift_y = sdbos(ref_image, exp_image)
 
-    v=20
+    v=10
 
     plt.rcParams['font.size'] = 15
     plt.rcParams['font.family'] = 'Times New Roman'
@@ -297,7 +310,7 @@ if __name__ == "__main__":
 
     # ---- 1つ目のサブプロット ----
     im1 = ax1.imshow(
-        shift_x-np.mean(shift_x[:500,:]),  # 平均を引いて中心化
+        shift_x-torch.mean(shift_x[:500,:]),  # 平均を引いて中心化
         cmap="bwr", vmin=-v, vmax=v
     )
     divider1 = make_axes_locatable(ax1)
@@ -310,7 +323,7 @@ if __name__ == "__main__":
 
     # ---- 2つ目のサブプロット ----
     im2 = ax2.imshow(
-        shift_y-np.mean(shift_y[:500,:]),  # 平均を引いて中心化
+        shift_y-torch.mean(shift_y[:500,:]),  # 平均を引いて中心化
         cmap="bwr", vmin=-v, vmax=v
     )
     divider2 = make_axes_locatable(ax2)
